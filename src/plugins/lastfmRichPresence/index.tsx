@@ -28,8 +28,16 @@ interface TrackData {
     name: string;
     album: string;
     artist: string;
-    url: string;
+    trackUrl: string;
+    albumUrl?: string;
+    artistUrl?: string;
     imageUrl?: string;
+    timestamps?: {
+        start: number;
+        end: number;
+    };
+    client?: string;
+    clientDetails: string;
 }
 
 const enum NameFormat {
@@ -38,7 +46,8 @@ const enum NameFormat {
     SongFirst = "song-first",
     ArtistOnly = "artist",
     SongOnly = "song",
-    AlbumName = "album"
+    AlbumName = "album",
+    ClientName = "client"
 }
 
 // Last.fm API keys are essentially public information and have no access to your account, so including one here is fine.
@@ -48,8 +57,9 @@ const LASTFM_PLACEHOLDER_IMAGE_HASH = "2a96cbd8b46e442fc41c2b86b821562f";
 
 const logger = new Logger("LastFMRichPresence");
 
-async function getApplicationAsset(key: string): Promise<string> {
-    return (await ApplicationAssetUtils.fetchAssetIds(DISCORD_APP_ID, [key]))[0];
+async function getApplicationAsset(key: string): Promise<string | undefined> {
+    const ids = await ApplicationAssetUtils.fetchAssetIds(DISCORD_APP_ID, [key]);
+    return ids.length > 0 ? ids[0] : undefined;
 }
 
 function setActivity(activity: Activity | null) {
@@ -65,8 +75,17 @@ const settings = definePluginSettings({
         description: "Last.fm username",
         type: OptionType.STRING,
     },
+    useListenBrainz: {
+        description: "use listenbrainz instead of last.fm",
+        type: OptionType.BOOLEAN,
+        default: false,
+    },
+    listenBrainzUsername: {
+        description: "listenbrainz username",
+        type: OptionType.STRING,
+    },
     shareUsername: {
-        description: "Show link to Last.fm profile",
+        description: "Show link to Last.fm/listenbrainz profile",
         type: OptionType.BOOLEAN,
         default: false,
     },
@@ -76,7 +95,7 @@ const settings = definePluginSettings({
         default: true,
     },
     hideWithSpotify: {
-        description: "Hide Last.fm presence if spotify is running",
+        description: "Hide Last.fm/listenbrainz presence if spotify is running",
         type: OptionType.BOOLEAN,
         default: true,
     },
@@ -137,6 +156,10 @@ const settings = definePluginSettings({
             {
                 label: "Use album name (falls back to custom status text if song has no album)",
                 value: NameFormat.AlbumName
+            },
+            {
+                label: "Use streaming service or music player name (falls back to custom status text if no client info is available)",
+                value: NameFormat.ClientName
             }
         ],
     },
@@ -161,7 +184,12 @@ const settings = definePluginSettings({
         ],
     },
     showLastFmLogo: {
-        description: "Show the Last.fm logo by the album cover",
+        description: "Show the Last.fm/ListenBrainz/streaming service/music player logo by the album cover",
+        type: OptionType.BOOLEAN,
+        default: true,
+    },
+    sendTimestamps: {
+        description: "Show track duration / listening progress bar (currently only works on listenbrainz), keep in mind that these might not always be 100% accurate",
         type: OptionType.BOOLEAN,
         default: true,
     },
@@ -173,21 +201,26 @@ const settings = definePluginSettings({
 
 export default definePlugin({
     name: "LastFMRichPresence",
-    description: "Little plugin for Last.fm rich presence",
-    authors: [Devs.dzshn, Devs.RuiNtD, Devs.blahajZip, Devs.archeruwu],
+    description: "Little plugin for Last.fm and ListenBrainz rich presence",
+    authors: [Devs.dzshn, Devs.RuiNtD, Devs.blahajZip, Devs.archeruwu, Devs.ConfiG],
 
     settings,
 
     start() {
+        this.timestampStuff = {
+            lastTrack: "",
+            lastTrackChange: Date.now()
+        };
         this.updatePresence();
         this.updateInterval = setInterval(() => { this.updatePresence(); }, 16000);
     },
 
     stop() {
         clearInterval(this.updateInterval);
+        this.timestampStuff = undefined;
     },
 
-    async fetchTrackData(): Promise<TrackData | null> {
+    async fetchLastFM(): Promise<TrackData | null> {
         if (!settings.store.username)
             return null;
 
@@ -219,13 +252,190 @@ export default definePlugin({
                 name: trackData.name || "Unknown",
                 album: trackData.album["#text"],
                 artist: trackData.artist["#text"] || "Unknown",
-                url: trackData.url,
-                imageUrl: trackData.image?.find((x: any) => x.size === "large")?.["#text"]
+                trackUrl: trackData.url,
+                artistUrl: `https://www.last.fm/music/${encodeURIComponent(trackData.artist)}`,
+                albumUrl: `https://www.last.fm/music/${encodeURIComponent(trackData.artist)}/${encodeURIComponent(trackData.album)}`,
+                imageUrl: trackData.image?.find((x: any) => x.size === "large")?.["#text"],
+                clientDetails: "Last.fm"
             };
         } catch (e) {
             logger.error("Failed to query Last.fm API", e);
             // will clear the rich presence if API fails
             return null;
+        }
+    },
+
+    async fetchListenBrainz(): Promise<TrackData | null> {
+        if (!settings.store.listenBrainzUsername)
+            return null;
+
+        try {
+            const res = await fetch(`https://api.listenbrainz.org/1/user/${settings.store.listenBrainzUsername}/playing-now`);
+            if (!res.ok) throw `${res.status} ${res.statusText}`;
+
+            const json = await res.json();
+            if (json.error) {
+                logger.error("Error from ListenBrainz API", `${json.error}: ${json.message}`);
+                return null;
+            }
+
+            const trackData = json.payload?.listens?.[0];
+
+            if (!trackData?.playing_now || !trackData.track_metadata)
+                return null;
+
+            const trackMeta = trackData.track_metadata;
+            const trackAddInfo = trackMeta.additional_info;
+
+            let recordingMbid = trackAddInfo?.recording_mbid;
+            let releaseMbid = trackAddInfo?.release_mbid;
+            let artistMbids = trackAddInfo?.artist_mbids || [];
+
+            if (!recordingMbid || !releaseMbid || artistMbids.length === 0) {
+                const metadata = await this.lookupListenBrainzMetadata(
+                    trackMeta.artist_name,
+                    trackMeta.track_name,
+                    trackMeta.release_name
+                );
+
+                recordingMbid = recordingMbid || metadata.recording_mbid;
+                releaseMbid = releaseMbid || metadata.release_mbid;
+                if (artistMbids.length === 0 && metadata.artist_mbids)
+                    artistMbids = metadata.artist_mbids;
+            }
+
+            let clientDetails = "ListenBrainz";
+            if (trackAddInfo) {
+                const musicService = trackAddInfo.music_service_name || trackAddInfo.music_service;
+
+                let mediaPlayer = trackAddInfo.media_player;
+                if (mediaPlayer && trackAddInfo.media_player_version)
+                    mediaPlayer = `${mediaPlayer} ${trackAddInfo.media_player_version}`;
+
+                let submissionClient = trackAddInfo.submission_client;
+                if (submissionClient && trackAddInfo.submission_client_version)
+                    submissionClient = `${submissionClient} ${trackAddInfo.submission_client_version}`;
+
+                if (submissionClient && trackAddInfo.submission_client !== trackAddInfo.media_player)
+                    clientDetails = `${clientDetails} via ${submissionClient}`;
+
+                if (musicService && mediaPlayer)
+                    clientDetails = `${musicService} through ${mediaPlayer} to ${clientDetails}`;
+                else if (musicService)
+                    clientDetails = `${musicService} to ${clientDetails}`;
+                else if (mediaPlayer)
+                    clientDetails = `${mediaPlayer} to ${clientDetails}`;
+            }
+
+            return {
+                name: trackMeta.track_name || "Unknown",
+                album: trackMeta.release_name || "Unknown",
+                artist: trackMeta.artist_name || "Unknown",
+                trackUrl: trackAddInfo?.origin_url || recordingMbid && `https://musicbrainz.org/recording/${recordingMbid}`,
+                artistUrl: artistMbids.length === 1 ? `https://musicbrainz.org/artist/${artistMbids[0]}` : undefined,
+                albumUrl: releaseMbid && `https://musicbrainz.org/release/${releaseMbid}`,
+                imageUrl: releaseMbid && `https://coverartarchive.org/release/${releaseMbid}/front`,
+                timestamps: settings.store.sendTimestamps ? await this.getListenBrainzTimestamps(trackData) : undefined,
+                client: trackAddInfo?.music_service_name || trackAddInfo?.music_service || trackAddInfo?.media_player,
+                clientDetails
+            };
+        } catch (e) {
+            logger.error("Failed to query ListenBrainz API", e);
+            // will clear the rich presence if API fails
+            return null;
+        }
+    },
+
+    async lookupListenBrainzMetadata(artistName: string, recordingName: string, releaseName: string | undefined) {
+        try {
+            const params = new URLSearchParams({
+                artist_name: artistName,
+                recording_name: recordingName
+            });
+            if (releaseName)
+                params.append("release_name", releaseName);
+
+            const res = await fetch(`https://api.listenbrainz.org/1/metadata/lookup/?${params}`);
+            if (!res.ok) throw `${res.status} ${res.statusText}`;
+
+            const json = await res.json();
+            if (json.error) {
+                logger.error("Error from ListenBrainz API", `${json.error}: ${json.message}`);
+                return {};
+            }
+
+            return json;
+        } catch (e) {
+            logger.error("Failed to query ListenBrainz API", e);
+            return {};
+        }
+    },
+
+    // attempt to get timestamps using some heuristics
+    // pausing while listening and unpausing before the track would've ended will throw this off
+    // but other than that it's pretty accurate, at least accurate enough :p
+    async getListenBrainzTimestamps(trackData: any) {
+        try {
+            if (!trackData.track_metadata.additional_info?.duration && !trackData.track_metadata.additional_info?.duration_ms)
+                return undefined;
+
+            const now = Date.now();
+            const duration = trackData.track_metadata.additional_info.duration_ms ||
+                trackData.track_metadata.additional_info.duration * 1000;
+
+            const trackMetadataJson = JSON.stringify(trackData.track_metadata);
+            // track obviously changed
+            if (trackMetadataJson !== this.timestampStuff.lastTrack) {
+                this.timestampStuff.lastTrack = trackMetadataJson;
+                this.timestampStuff.lastTrackChange = now;
+            }
+            // track probably changed because current time exceeded expected track end time
+            else if (now > this.timestampStuff.lastTrackChange + duration) {
+                this.timestampStuff.lastTrackChange = now;
+            }
+
+            const res = await fetch(`https://api.listenbrainz.org/1/user/${settings.store.listenBrainzUsername}/listens?count=1`);
+            if (!res.ok) throw `${res.status} ${res.statusText}`;
+
+            const json = await res.json();
+            if (json.error) {
+                logger.error("Error from ListenBrainz API", `${json.error}: ${json.message}`);
+                return undefined;
+            }
+
+            const listenAddInfo = json.payload.count >= 1 && json.payload.listens[0].track_metadata.additional_info;
+            if (listenAddInfo?.duration || listenAddInfo?.duration_ms) {
+                const listenDuration = listenAddInfo.duration_ms || listenAddInfo.duration * 1000;
+                const listenStart = json.payload.listens[0].listened_at * 1000;
+                const listenEnd = listenStart + listenDuration;
+
+                // this listen is current! we have accurate info!
+                if (now <= listenEnd) {
+                    return {
+                        start: listenStart,
+                        end: listenEnd
+                    };
+                }
+
+                // it is Pretty Safe to assume we are listening to music sequentially without stopping Most Of The Time
+                if (now <= listenEnd + duration) {
+                    return {
+                        start: listenEnd,
+                        end: listenEnd + duration
+                    };
+                }
+            }
+
+            // this technically won't be accurate but good enough
+            // until we get accurate info halfway through or 4 minutes into the track
+            // or it's not the first track we are listening to in a row
+            return {
+                start: this.timestampStuff.lastTrackChange,
+                end: this.timestampStuff.lastTrackChange + duration
+            };
+        } catch (e) {
+            logger.error("Failed to query ListenBrainz API", e);
+            return undefined;
         }
     },
 
@@ -255,7 +465,7 @@ export default definePlugin({
             }
         }
 
-        const trackData = await this.fetchTrackData();
+        const trackData = settings.store.useListenBrainz ? await this.fetchListenBrainz() : await this.fetchLastFM();
         if (!trackData) return null;
 
         const largeImage = this.getLargeImage(trackData);
@@ -264,8 +474,11 @@ export default definePlugin({
                 large_image: await getApplicationAsset(largeImage),
                 large_text: trackData.album || undefined,
                 ...(settings.store.showLastFmLogo && {
-                    small_image: await getApplicationAsset("lastfm-small"),
-                    small_text: "Last.fm"
+                    small_image: trackData.client && (
+                        await getApplicationAsset(`client-${trackData.client}-small`) ||
+                        trackData.trackUrl && await getApplicationAsset(encodeURI(`https://s2.googleusercontent.com/s2/favicons?domain=${trackData.trackUrl}`))
+                    ) || await getApplicationAsset("lastfm-small"),
+                    small_text: trackData.clientDetails
                 }),
             } : {
                 large_image: await getApplicationAsset("lastfm-large"),
@@ -274,11 +487,20 @@ export default definePlugin({
 
         const buttons: ActivityButton[] = [];
 
-        if (settings.store.shareUsername)
-            buttons.push({
-                label: "Last.fm Profile",
-                url: `https://www.last.fm/user/${settings.store.username}`,
-            });
+        if (settings.store.shareUsername) {
+            if (settings.store.useListenBrainz) {
+                buttons.push({
+                    label: "ListenBrainz Profile",
+                    url: `https://listenbrainz.org/user/${settings.store.listenBrainzUsername}`,
+                });
+            }
+            else {
+                buttons.push({
+                    label: "Last.fm Profile",
+                    url: `https://www.last.fm/user/${settings.store.username}`,
+                });
+            }
+        }
 
         const statusName = (() => {
             switch (settings.store.nameFormat) {
@@ -292,6 +514,8 @@ export default definePlugin({
                     return trackData.name;
                 case NameFormat.AlbumName:
                     return trackData.album || settings.store.statusName;
+                case NameFormat.ClientName:
+                    return trackData.client || settings.store.statusName;
                 default:
                     return settings.store.statusName;
             }
@@ -316,17 +540,16 @@ export default definePlugin({
                 button_urls: buttons.map(v => v.url),
             },
 
+            timestamps: trackData.timestamps,
+
             type: settings.store.useListeningStatus ? ActivityType.LISTENING : ActivityType.PLAYING,
             flags: ActivityFlags.INSTANCE,
         };
 
         if (settings.store.clickableLinks) {
-            activity.details_url = trackData.url;
-            activity.state_url = `https://www.last.fm/music/${encodeURIComponent(trackData.artist)}`;
-
-            if (trackData.album) {
-                activity.assets!.large_url = `https://www.last.fm/music/${encodeURIComponent(trackData.artist)}/${encodeURIComponent(trackData.album)}`;
-            }
+            activity.details_url = trackData.trackUrl;
+            activity.state_url = trackData.artistUrl;
+            activity.assets!.large_url = trackData.albumUrl;
         }
 
         return activity;
