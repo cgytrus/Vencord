@@ -10,6 +10,7 @@ on:
             - scripts/build/**
             - package.json
             - pnpm-lock.yaml
+    workflow_dispatch:
 env:
     FORCE_COLOR: true
 
@@ -42,7 +43,7 @@ jobs:
 
             - name: Clean up obsolete files
               run: |
-                  rm -rf dist/*-unpacked dist/monaco Vencord.user.css vencordDesktopRenderer.css vencordDesktopRenderer.css.map
+                  rm -rf dist/*-unpacked dist/vendor Vencord.user.css vencordDesktopRenderer.css vencordDesktopRenderer.css.map
 
             - name: Get some values needed for the release
               id: release_values
@@ -59,7 +60,6 @@ jobs:
                   RELEASE_TAG: ${{ env.release_tag }}
 
             - name: Upload DevBuild to builds repo
-              if: github.repository == 'Vendicated/Vencord'
               run: |
                   git config --global user.name "$USERNAME"
                   git config --global user.email actions@github.com
@@ -76,5 +76,5 @@ jobs:
                   git push --force https://$USERNAME:$API_TOKEN@github.com/$GH_REPO.git
               env:
                   API_TOKEN: ${{ secrets.BUILDS_TOKEN }}
-                  GH_REPO: Vencord/builds
+                  GH_REPO: cgytrus/vencord-build
                   USERNAME: GitHub-Actions
