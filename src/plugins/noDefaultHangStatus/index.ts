@@ -8,15 +8,16 @@ import { Devs } from "@utils/constants";
 import definePlugin from "@utils/types";
 
 export default definePlugin({
-    name: "FixImagesQuality",
-    description: "Improves quality of images in chat by forcing png format",
-    authors: [Devs.Nuckyz],
+    name: "NoDefaultHangStatus",
+    description: "Disable the default hang status when joining voice channels",
+    authors: [Devs.D3SOX],
+
     patches: [
         {
-            find: ".handleImageLoad)",
+            find: ".CHILLING)",
             replacement: {
-                match: /(?<=\i=)"webp"/,
-                replace: '"png"'
+                match: /{enableHangStatus:(\i),/,
+                replace: "{_enableHangStatus:$1=false,"
             }
         }
     ]
