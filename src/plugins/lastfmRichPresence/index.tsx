@@ -93,6 +93,10 @@ const settings = definePluginSettings({
         description: "listenbrainz username",
         type: OptionType.STRING,
     },
+    listenBrainzToken: {
+        description: "listenbrainz user token",
+        type: OptionType.STRING,
+    },
     shareUsername: {
         description: "Show link to Last.fm/listenbrainz profile",
         type: OptionType.BOOLEAN,
@@ -370,7 +374,11 @@ export default definePlugin({
             if (releaseName)
                 params.append("release_name", releaseName);
 
-            const res = await fetch(`https://api.listenbrainz.org/1/metadata/lookup/?${params}`);
+            const res = await fetch(`https://api.listenbrainz.org/1/metadata/lookup/?${params}`, {
+                headers: {
+                    "Authorization": `Token ${settings.store.listenBrainzToken}`
+                }
+            });
             if (!res.ok) throw `${res.status} ${res.statusText}`;
 
             const json = await res.json();
