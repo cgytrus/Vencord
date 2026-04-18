@@ -211,6 +211,7 @@ const settings = definePluginSettings({
 export default definePlugin({
     name: "LastFMRichPresence",
     description: "Little plugin for Last.fm and ListenBrainz rich presence",
+    tags: ["Activity", "Media"],
     authors: [Devs.dzshn, Devs.RuiNtD, Devs.blahajZip, Devs.archeruwu, Devs.ConfiG],
 
     settings,
